@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
         .name = "login-cli",
     });
-
+    b.installArtifact(exe);
     // Run step
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
