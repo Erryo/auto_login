@@ -4,8 +4,18 @@ const Default_Delay_s = 30;
 const Max_Attempts = 3;
 const Default_Path = "data.txt";
 const Default_Path_Encrypted = "data.enc";
+const Sleep_notConnected_nano = std.time.ns_per_s * 30;
+const Sleep_noInternet_nano = std.time.ns_per_s * 10;
 const ChaCha20 = std.crypto.stream.chacha.ChaCha20IETF;
+const Auth_Path = "/api/captiveportal/access/logon/0/";
+const headers = "Content-Type: application/x-www-form-urlencoded";
+const Server_IP = "10.80.0.1";
+const Server_Port = 8000;
+
+const Ping_Addr_Port = 80;
+const Ping_Addr = "34.107.221.82";
 const random = std.crypto.random;
+const net = std.net;
 const Secret_Key: [32]u8 = [32]u8{
     0x4b, 0x65, 0x79, 0x21, 0x54, 0x68, 0x69, 0x73,
     0x49, 0x73, 0x4d, 0x79, 0x53, 0x65, 0x63, 0x72,
@@ -14,6 +24,7 @@ const Secret_Key: [32]u8 = [32]u8{
 };
 const alphabet_chars = std.base64.url_safe_alphabet_chars;
 const ParseError = error{ InvalidNonce, InvalidLine };
+const ChildError = error{ Unknown, NoConnection, Failed };
 
 const Help_Message =
     \\ -h,--help -> print the help message
@@ -344,6 +355,79 @@ pub fn base64_decode(input: []const u8, allocator: Allocator) ![]const u8 {
     return buffer;
 }
 
+fn get_ssid(s: *State) ![]const u8 {
+    return switch (@import("builtin").os.tag) {
+        .linux => get_ssid_linux(s),
+        .windows => get_ssid_windows(s),
+        else => error.UnsupportedPlatform,
+    };
+}
+
+fn get_ssid_linux(s: *State) ![]const u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = s.allocator,
+        .argv = &.{ "iwgetid", "-r" },
+    });
+    defer s.allocator.free(result.stderr);
+    defer s.allocator.free(result.stdout);
+
+    if (result.term != .Exited or result.term.Exited != 0) return ChildError.Failed;
+
+    const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    if (trimmed.len == 0) return ChildError.NoConnection;
+
+    return try s.allocator.dupe(u8, trimmed);
+}
+fn get_ssid_windows(s: *State) ![]const u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = s.allocator,
+        .argv = &.{ "netsh", "wlan", "show", "interfaces" },
+    });
+    defer s.allocator.free(result.stderr);
+    defer s.allocator.free(result.stdout);
+
+    if (result.term != .Exited or result.term.Exited != 0) return ChildError.Failed;
+
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
+        // Match "    SSID                   : MyNetwork"
+        // but NOT "BSSID" lines
+        if (std.mem.startsWith(u8, trimmed, "SSID") and
+            !std.mem.startsWith(u8, trimmed, "BSSID"))
+        {
+            const colon = std.mem.indexOf(u8, trimmed, ":") orelse continue;
+            const ssid = std.mem.trim(u8, trimmed[colon + 1 ..], &std.ascii.whitespace);
+            if (ssid.len == 0) continue;
+            return try s.allocator.dupe(u8, ssid);
+        }
+    }
+    return ChildError.NoConnection;
+}
+
+fn connected_to_target(s: *State) !bool {
+    const ssid = get_ssid(s) catch |err| {
+        if (err == ChildError.NoConnection or err == ChildError.Failed) return false else return err;
+    };
+    defer s.allocator.free(ssid);
+    //    try s.stdout.print("SSID:{s}\n", .{ssid});
+    return std.mem.eql(u8, s.network_name, ssid);
+}
+
+fn check_internet(addr: net.Address) !bool {
+    _ = net.tcpConnectToAddress(addr) catch |err| {
+        if (err == net.TcpConnectToAddressError.NetworkUnreachable) return false else return err;
+    };
+    return true;
+}
+
+fn send_connect(request: []const u8, addr: net.Address) !void {
+    const stream = try net.tcpConnectToAddress(addr);
+    defer stream.close();
+
+    try stream.writeAll(request);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer if (gpa.deinit() == .leak) @panic("leaked");
@@ -369,7 +453,42 @@ pub fn main() !void {
     defer state.stdout.flush() catch |err| {
         std.debug.print("failed to flush stdout:{any}\n", .{err});
     };
+    try parse_arguments(&state);
+
+    const addr: net.Address = try .parseIp4(Ping_Addr, Ping_Addr_Port);
+    const server_addr: net.Address = try .parseIp4(Server_IP, Server_Port);
+
+    const body = try std.fmt.allocPrint(state.allocator, "user={s}&password={s}", .{ state.user_name, state.password });
+    defer state.allocator.free(body);
+
+    const request = try std.fmt.allocPrint(
+        allocator,
+        "POST {s} HTTP/1.1\r\n" ++
+            "Host: {s}:{d}\r\n" ++
+            "Content-Type: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n" ++
+            "{s}",
+        .{ Auth_Path, Server_IP, Server_Port, headers, body.len, body },
+    );
+    defer allocator.free(request);
     // PARSE
 
-    try parse_arguments(&state);
+    while (true) {
+        const connected: bool = try connected_to_target(&state);
+        if (!connected) {
+            std.debug.print("no wlan", .{});
+            std.Thread.sleep(Sleep_notConnected_nano);
+            continue;
+        }
+        const internet: bool = try check_internet(addr);
+        if (internet) {
+            std.debug.print("got internet\n", .{});
+            std.Thread.sleep(Sleep_noInternet_nano);
+            continue;
+        }
+        std.debug.print("no  internet connection\n", .{});
+        try send_connect(request, server_addr);
+    }
 }
