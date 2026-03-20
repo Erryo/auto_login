@@ -1,21 +1,21 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Default_Delay_s = 30;
+const ChaCha20 = std.crypto.stream.chacha.ChaCha20IETF;
+const random = std.crypto.random;
+const net = std.net;
+
+const Sleep_notConnected_nano = std.time.ns_per_s * 30;
+const Sleep_noInternet_nano = std.time.ns_per_s * 10;
+const Auth_Path = "/api/captiveportal/access/logon/0/";
+const headers = "application/x-www-form-urlencoded";
+const Server_IP = "10.80.0.1";
+const Server_Port = 8000;
+const Ping_Addr_Port = 80;
+const Ping_Addr = "34.107.221.82";
+
 const Max_Attempts = 3;
 const Default_Path = "data.txt";
 const Default_Path_Encrypted = "data.enc";
-const Sleep_notConnected_nano = std.time.ns_per_s * 30;
-const Sleep_noInternet_nano = std.time.ns_per_s * 10;
-const ChaCha20 = std.crypto.stream.chacha.ChaCha20IETF;
-const Auth_Path = "/api/captiveportal/access/logon/0/";
-const headers = "Content-Type: application/x-www-form-urlencoded";
-const Server_IP = "10.80.0.1";
-const Server_Port = 8000;
-
-const Ping_Addr_Port = 80;
-const Ping_Addr = "34.107.221.82";
-const random = std.crypto.random;
-const net = std.net;
 const Secret_Key: [32]u8 = [32]u8{
     0x4b, 0x65, 0x79, 0x21, 0x54, 0x68, 0x69, 0x73,
     0x49, 0x73, 0x4d, 0x79, 0x53, 0x65, 0x63, 0x72,
@@ -43,7 +43,6 @@ const State = struct {
     password: []u8,
     network_name: []u8,
     encrypt: bool = false,
-    delay_s: u32,
 
     pub fn init(allocator: Allocator) !State {
         const state: State = .{
@@ -56,7 +55,6 @@ const State = struct {
             .password = undefined,
             .network_name = undefined,
             .mode = Mode.uninnited,
-            .delay_s = Default_Delay_s,
         };
         return state;
     }
@@ -410,14 +408,14 @@ fn connected_to_target(s: *State) !bool {
         if (err == ChildError.NoConnection or err == ChildError.Failed) return false else return err;
     };
     defer s.allocator.free(ssid);
-    //    try s.stdout.print("SSID:{s}\n", .{ssid});
     return std.mem.eql(u8, s.network_name, ssid);
 }
 
 fn check_internet(addr: net.Address) !bool {
-    _ = net.tcpConnectToAddress(addr) catch |err| {
+    const stream = net.tcpConnectToAddress(addr) catch |err| {
         if (err == net.TcpConnectToAddressError.NetworkUnreachable) return false else return err;
     };
+    stream.close();
     return true;
 }
 
@@ -472,13 +470,14 @@ pub fn main() !void {
             "{s}",
         .{ Auth_Path, Server_IP, Server_Port, headers, body.len, body },
     );
+    std.debug.print("request:{s}\n", .{request});
     defer allocator.free(request);
     // PARSE
 
     while (true) {
         const connected: bool = try connected_to_target(&state);
         if (!connected) {
-            std.debug.print("no wlan", .{});
+            std.debug.print("no wlan\n", .{});
             std.Thread.sleep(Sleep_notConnected_nano);
             continue;
         }
