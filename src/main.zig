@@ -43,6 +43,8 @@ const State = struct {
     password: []u8,
     network_name: []u8,
     encrypt: bool = false,
+    real_encrypted: []u8,
+    real_plaintext: []u8,
 
     pub fn init(allocator: Allocator) !State {
         const state: State = .{
@@ -55,6 +57,8 @@ const State = struct {
             .password = undefined,
             .network_name = undefined,
             .mode = Mode.uninnited,
+            .real_plaintext = undefined,
+            .real_encrypted = undefined,
         };
         return state;
     }
@@ -65,6 +69,8 @@ const State = struct {
             s.allocator.free(s.user_name);
             s.allocator.free(s.password);
             s.allocator.free(s.network_name);
+            s.allocator.free(s.real_encrypted);
+            s.allocator.free(s.real_plaintext);
         }
         s.mode = .uninnited;
     }
@@ -80,6 +86,16 @@ const Mode = enum {
 fn parse_arguments(s: *State) !void {
     const args = try std.process.argsAlloc(s.allocator);
     defer std.process.argsFree(s.allocator, args);
+    std.debug.print("path:{s}\n", .{args[0]});
+
+    const real = try std.fs.selfExeDirPathAlloc(s.allocator);
+    defer s.allocator.free(real);
+
+    s.real_encrypted = try std.fs.path.join(s.allocator, &.{ real, Default_Path_Encrypted });
+    errdefer s.allocator.free(s.real_encrypted);
+    s.real_plaintext = try std.fs.path.join(s.allocator, &.{ real, Default_Path });
+    errdefer s.allocator.free(s.real_plaintext);
+    std.debug.print("real_plaintext:{s}\nreal_encrypted:{s}\n", .{ s.real_plaintext, s.real_encrypted });
 
     if (args.len == 1) {
         s.mode = .readin;
@@ -181,7 +197,7 @@ fn read_in(s: *State) !void {
 }
 
 fn read_plaintext(s: *State) !void {
-    const file = try std.fs.cwd().openFile(Default_Path, .{ .mode = .read_only });
+    const file = try std.fs.openFileAbsolute(s.real_plaintext, .{ .mode = .read_only });
     defer file.close();
     var buffer: [512]u8 = std.mem.zeroes([512]u8);
     var r = file.reader(&buffer);
@@ -205,7 +221,7 @@ fn read_plaintext(s: *State) !void {
 }
 
 fn read_encrypt(s: *State) !void {
-    const file = try std.fs.cwd().openFile(Default_Path_Encrypted, .{ .mode = .read_only });
+    const file = try std.fs.openFileAbsolute(s.real_encrypted, .{ .mode = .read_only });
     defer file.close();
 
     var buffer: [512]u8 = std.mem.zeroes([512]u8);
@@ -262,7 +278,7 @@ fn process_encrypted_line(line: []u8, s: *State) ![]u8 {
 }
 
 pub fn write_encrypt(s: *State) !void {
-    const file = try std.fs.cwd().createFile(Default_Path_Encrypted, .{ .read = true, .truncate = true });
+    const file = try std.fs.createFileAbsolute(s.real_encrypted, .{ .read = true, .truncate = true });
     defer file.close();
 
     var buffer = std.mem.zeroes([512]u8);
@@ -318,7 +334,7 @@ pub fn write_encrypt(s: *State) !void {
 }
 
 pub fn write_plaintext(s: *State) !void {
-    const file = try std.fs.cwd().createFile(Default_Path, .{ .read = true, .truncate = true });
+    const file = try std.fs.createFileAbsolute(s.real_plaintext, .{ .read = true, .truncate = true });
     defer file.close();
     var buffer = std.mem.zeroes([512]u8);
     var w = file.writer(&buffer);
