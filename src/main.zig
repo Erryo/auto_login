@@ -13,6 +13,7 @@ const Secret_Key: [32]u8 = [32]u8{
     0x41, 0x45, 0x53, 0x32, 0x35, 0x36, 0x47, 0x43,
 };
 const alphabet_chars = std.base64.url_safe_alphabet_chars;
+const ParseError = error{ InvalidNonce, InvalidLine };
 
 const Help_Message =
     \\ -h,--help -> print the help message
@@ -50,13 +51,6 @@ const State = struct {
     }
 
     pub fn deinit(s: *State) !void {
-        s.stdout.flush() catch |err| {
-            std.debug.print("failed to flush stdout:{any}\n", .{err});
-        };
-
-        s.allocator.free(s.stdout_buffer);
-        s.allocator.free(s.stdin_buffer);
-
         std.debug.print("deinit: s.mode: {s}\n", .{@tagName(s.mode)});
         if (s.mode == .ready) {
             s.allocator.free(s.user_name);
@@ -80,7 +74,7 @@ fn parse_arguments(s: *State) !void {
 
     if (args.len == 1) {
         s.mode = .readin;
-        try read_encrypt(s);
+        try read_in(s);
         return;
     }
 
@@ -100,7 +94,7 @@ fn parse_arguments(s: *State) !void {
     if (setup_b) {
         try setup(s);
     } else {
-        try read_encrypt(s);
+        try read_in(s);
     }
     try s.stdout.flush();
 }
@@ -156,8 +150,52 @@ fn setup(s: *State) !void {
     s.mode = .ready;
 }
 
-fn read_encrypt(s: *State) !void {
+fn read_in(s: *State) !void {
     s.mode = .readin;
+    if (s.encrypt) {
+        read_encrypt(s) catch |err| {
+            if (err == std.fs.File.OpenError.FileNotFound) {
+                try read_plaintext(s);
+            } else {
+                return err;
+            }
+        };
+    } else {
+        read_plaintext(s) catch |err| {
+            if (err == std.fs.File.OpenError.FileNotFound) {
+                try read_encrypt(s);
+            } else {
+                return err;
+            }
+        };
+    }
+}
+
+fn read_plaintext(s: *State) !void {
+    const file = try std.fs.cwd().openFile(Default_Path, .{ .mode = .read_only });
+    defer file.close();
+    var buffer: [512]u8 = std.mem.zeroes([512]u8);
+    var r = file.reader(&buffer);
+    const reader = &r.interface;
+
+    const network_slice = try reader.takeDelimiterExclusive('\n');
+    s.network_name = try s.allocator.dupe(u8, network_slice);
+
+    const username_slice = try reader.takeDelimiterExclusive('\n');
+    s.user_name = try s.allocator.dupe(u8, username_slice);
+
+    const password_slice = try reader.takeDelimiterExclusive('\n');
+    s.password = try s.allocator.dupe(u8, password_slice);
+
+    std.debug.print("...........\n", .{});
+    std.debug.print("nework:{s}\n", .{s.network_name});
+    std.debug.print("user_name:{s}\n", .{s.user_name});
+    std.debug.print("password:{s}\n", .{s.password});
+    std.debug.print("+++++++++++++++++++++++++++\n", .{});
+    s.mode = .ready;
+}
+
+fn read_encrypt(s: *State) !void {
     const file = try std.fs.cwd().openFile(Default_Path_Encrypted, .{ .mode = .read_only });
     defer file.close();
 
@@ -166,30 +204,30 @@ fn read_encrypt(s: *State) !void {
     const reader = &r.interface;
 
     const network_slice = try reader.takeDelimiterExclusive('\n');
-    std.debug.print("network_slice: {s}\n", .{network_slice});
-    s.network_name = try process_line(network_slice, s);
+    //  std.debug.print("network_slice: {s}\n", .{network_slice});
+    s.network_name = try process_encrypted_line(network_slice, s);
 
     const username_slice = try reader.takeDelimiterExclusive('\n');
-    std.debug.print("username_slice: {s}\n", .{username_slice});
-    s.user_name = try process_line(username_slice, s);
+    //   std.debug.print("username_slice: {s}\n", .{username_slice});
+    s.user_name = try process_encrypted_line(username_slice, s);
 
     const password_slice = try reader.takeDelimiterExclusive('\n');
-    std.debug.print("password_slice: {s}\n", .{password_slice});
-    s.password = try process_line(password_slice, s);
+    //    std.debug.print("password_slice: {s}\n", .{password_slice});
+    s.password = try process_encrypted_line(password_slice, s);
 
     s.mode = .ready;
-
+    //
     std.debug.print("...........\n", .{});
     std.debug.print("nework:{s}\n", .{s.network_name});
     std.debug.print("user_name:{s}\n", .{s.user_name});
     std.debug.print("password:{s}\n", .{s.password});
     std.debug.print("+++++++++++++++++++++++++++\n", .{});
 }
-fn process_line(line: []u8, s: *State) ![]u8 {
+fn process_encrypted_line(line: []u8, s: *State) ![]u8 {
     var it = std.mem.splitAny(u8, line, ":");
     var idx: u8 = 0;
-    var nonce_encoded: []const u8 = undefined;
-    var data_encoded: []const u8 = undefined;
+    var nonce_encoded: ?[]const u8 = null;
+    var data_encoded: ?[]const u8 = null;
     while (it.next()) |part| {
         defer idx += 1;
         if (idx == 0) {
@@ -198,17 +236,14 @@ fn process_line(line: []u8, s: *State) ![]u8 {
             data_encoded = part;
         }
     }
-    std.debug.print("-----aoeu-----\n", .{});
-    std.debug.print("nonce_enc:{s}\n", .{nonce_encoded});
-    std.debug.print("data_enc:{s}\n", .{data_encoded});
+    if (data_encoded == null or nonce_encoded == null) return ParseError.InvalidLine;
 
-    const nonce_slice = try base64_decode(nonce_encoded, s.allocator);
-    std.debug.print("nonce_dec len:{d}:{s}\n", .{ nonce_slice.len, nonce_slice });
+    const nonce_slice = try base64_decode(nonce_encoded.?, s.allocator);
     defer s.allocator.free(nonce_slice);
+    if (nonce_slice.len != 12) return ParseError.InvalidNonce;
     const nonce = nonce_slice[0..12].*;
 
-    const encrypted_data = try base64_decode(data_encoded, s.allocator);
-    std.debug.print("data_dec:{s}\n", .{encrypted_data});
+    const encrypted_data = try base64_decode(data_encoded.?, s.allocator);
     defer s.allocator.free(encrypted_data);
 
     const plain_data: []u8 = try s.allocator.dupe(u8, encrypted_data);
@@ -232,7 +267,6 @@ pub fn write_encrypt(s: *State) !void {
         defer s.allocator.free(encrypted_data);
 
         ChaCha20.xor(encrypted_data, s.network_name, 0, Secret_Key, nonce);
-        std.debug.print("nonce_network:{s}\n", .{nonce});
 
         const encoded_data = try base64_encode(encrypted_data, s.allocator);
         defer s.allocator.free(encoded_data);
@@ -249,7 +283,6 @@ pub fn write_encrypt(s: *State) !void {
         defer s.allocator.free(encrypted_data);
 
         ChaCha20.xor(encrypted_data, s.user_name, 0, Secret_Key, nonce);
-        std.debug.print("nonce_username:{s}\n", .{nonce});
 
         const encoded_data = try base64_encode(encrypted_data, s.allocator);
         defer s.allocator.free(encoded_data);
@@ -265,7 +298,6 @@ pub fn write_encrypt(s: *State) !void {
         defer s.allocator.free(encrypted_data);
 
         ChaCha20.xor(encrypted_data, s.password, 0, Secret_Key, nonce);
-        std.debug.print("nonce_password:{s}\n", .{nonce});
 
         const encoded_data = try base64_encode(encrypted_data, s.allocator);
         defer s.allocator.free(encoded_data);
@@ -277,7 +309,7 @@ pub fn write_encrypt(s: *State) !void {
 }
 
 pub fn write_plaintext(s: *State) !void {
-    const file = try std.fs.cwd().createFile(Default_Path_Encrypted, .{ .read = true, .truncate = true });
+    const file = try std.fs.cwd().createFile(Default_Path, .{ .read = true, .truncate = true });
     defer file.close();
     var buffer = std.mem.zeroes([512]u8);
     var w = file.writer(&buffer);
@@ -318,21 +350,26 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout_buffer = try allocator.alloc(u8, 512);
+    defer allocator.free(stdout_buffer);
     var w = std.fs.File.stdout().writer(stdout_buffer);
     const writer = &w.interface;
 
     const stdin_buffer = try allocator.alloc(u8, 512);
+    defer allocator.free(stdin_buffer);
     var r = std.fs.File.stdin().reader(stdin_buffer);
     const reader = &r.interface;
 
     var state: State = try .init(allocator);
+    defer state.deinit() catch |err| @panic(@errorName(err));
     state.stdout = writer;
     state.stdin = reader;
     state.stdin_buffer = stdin_buffer;
     state.stdout_buffer = stdout_buffer;
 
+    defer state.stdout.flush() catch |err| {
+        std.debug.print("failed to flush stdout:{any}\n", .{err});
+    };
     // PARSE
 
     try parse_arguments(&state);
-    try state.deinit();
 }
